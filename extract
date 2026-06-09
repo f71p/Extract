@@ -1,0 +1,357 @@
+#!/usr/bin/env bash
+#
+# extract — universal archive/compression extractor
+#
+# Usage:
+#   extract [options] <file> [file2 file3 ...]
+#
+# Options:
+#   -d, --dir       Extract each archive into its own directory (named after the
+#                   archive). Good protection against "tarbombs".
+#   -o DIR          Extract into DIR (created if needed).
+#   -l, --list      List contents instead of extracting (where supported).
+#   -r, --remove    Remove the source archive after a successful extraction.
+#   -q, --quiet     Suppress per-tool output where possible.
+#   -v, --verbose   Verbose output.
+#   -h, --help      Show this help.
+#
+# Format detection is by extension first, then falls back to the `file` magic
+# database — so renamed / extension-less archives (common in CTF / pentest
+# loot) are still handled.
+
+set -o pipefail
+
+# ---------------------------------------------------------------------------
+# Config / globals
+# ---------------------------------------------------------------------------
+PROG="${0##*/}"
+OPT_DIR=0          # extract into per-archive directory
+OPT_OUT=""         # explicit output directory
+OPT_LIST=0         # list mode
+OPT_REMOVE=0       # remove source after extract
+OPT_QUIET=0
+OPT_VERBOSE=0
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+c_red=$'\033[31m'; c_grn=$'\033[32m'; c_ylw=$'\033[33m'; c_blu=$'\033[34m'; c_rst=$'\033[0m'
+# Drop colours if not a tty
+[ -t 2 ] || { c_red=; c_grn=; c_ylw=; c_blu=; c_rst=; }
+
+err()  { printf '%s%s:%s %s\n' "$c_red" "$PROG" "$c_rst" "$*" >&2; }
+warn() { printf '%s%s:%s %s\n' "$c_ylw" "$PROG" "$c_rst" "$*" >&2; }
+info() { [ "$OPT_QUIET" -eq 1 ] || printf '%s%s:%s %s\n' "$c_blu" "$PROG" "$c_rst" "$*" >&2; }
+vrb()  { [ "$OPT_VERBOSE" -eq 1 ] && printf '%s%s:%s %s\n' "$c_blu" "$PROG" "$c_rst" "$*" >&2; return 0; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Pick the first available command from a list; returns 1 if none found.
+pick() {
+    local c
+    for c in "$@"; do
+        if have "$c"; then printf '%s' "$c"; return 0; fi
+    done
+    return 1
+}
+
+usage() {
+    sed -n '3,30p' "$0" | sed 's/^# \{0,1\}//'
+    exit "${1:-0}"
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+files=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -d|--dir)     OPT_DIR=1 ;;
+        -o)           shift; OPT_OUT="$1" ;;
+        -l|--list)    OPT_LIST=1 ;;
+        -r|--remove)  OPT_REMOVE=1 ;;
+        -q|--quiet)   OPT_QUIET=1 ;;
+        -v|--verbose) OPT_VERBOSE=1 ;;
+        -h|--help)    usage 0 ;;
+        --)           shift; while [ $# -gt 0 ]; do files+=("$1"); shift; done ;;
+        -*)           err "unknown option: $1"; usage 1 ;;
+        *)            files+=("$1") ;;
+    esac
+    shift
+done
+
+[ "${#files[@]}" -eq 0 ] && usage 1
+
+# ---------------------------------------------------------------------------
+# Run a command honouring quiet mode
+# ---------------------------------------------------------------------------
+run() {
+    vrb "+ $*"
+    if [ "$OPT_QUIET" -eq 1 ]; then
+        "$@" >/dev/null 2>&1
+    else
+        "$@"
+    fi
+}
+
+# Pipe extractor: stream-decompress $1 into a file named $2
+# usage: stream_decompress <decompress-cmd...> -- <infile> <outfile>
+stream_to() {
+    local outfile="$1"; shift
+    vrb "+ $* > $outfile"
+    "$@" > "$outfile"
+}
+
+# ---------------------------------------------------------------------------
+# Decide working directory for an archive and cd into it.
+# Echoes the directory we end up in (caller restores with popd-equivalent).
+# ---------------------------------------------------------------------------
+prepare_destdir() {
+    local archive="$1" base dest
+    base="$(basename -- "$archive")"
+
+    if [ -n "$OPT_OUT" ]; then
+        dest="$OPT_OUT"
+    elif [ "$OPT_DIR" -eq 1 ]; then
+        # Strip recognised extensions to name the folder
+        dest="${base%.*}"
+        case "$base" in
+            *.tar.gz|*.tar.bz2|*.tar.xz|*.tar.zst|*.tar.lz4|*.tar.lz|*.tar.lzma|*.tar.Z)
+                dest="${base%.tar.*}" ;;
+        esac
+        # No extension stripped (or empty) -> avoid clobbering the source file
+        { [ -z "$dest" ] || [ "$dest" = "$base" ]; } && dest="${base}.extracted"
+    else
+        dest="."
+    fi
+
+    if [ "$dest" != "." ]; then
+        mkdir -p -- "$dest" || { err "cannot create directory: $dest"; return 1; }
+    fi
+    printf '%s' "$dest"
+}
+
+# ---------------------------------------------------------------------------
+# Determine a logical "type" for the file.
+# Output is a short token like: targz, tarbz2, tarxz, tarzst, tarlz4, tarlz,
+# tar, zip, 7z, rar, gz, bz2, xz, zst, lz4, lzma, lz, Z, cab, deb, rpm, iso,
+# cpio, ar, arj, lha
+# ---------------------------------------------------------------------------
+detect_type() {
+    local f="$1" lower magic
+    lower="$(printf '%s' "$f" | tr '[:upper:]' '[:lower:]')"
+
+    case "$lower" in
+        *.tar.gz|*.tgz|*.taz)         echo targz;  return ;;
+        *.tar.bz2|*.tbz|*.tbz2|*.tz2) echo tarbz2; return ;;
+        *.tar.xz|*.txz)               echo tarxz;  return ;;
+        *.tar.zst|*.tzst)             echo tarzst; return ;;
+        *.tar.lz4)                    echo tarlz4; return ;;
+        *.tar.lzma|*.tlz)             echo tarlzma;return ;;
+        *.tar.lz)                     echo tarlz;  return ;;
+        *.tar.z)                      echo tarZ;   return ;;
+        *.tar)                        echo tar;    return ;;
+        *.zip|*.jar|*.war|*.ear|*.apk|*.ipa|*.xpi|*.whl|*.nupkg|*.crx|*.odt|*.ods|*.odp|*.docx|*.xlsx|*.pptx)
+                                      echo zip;    return ;;
+        *.7z|*.7zip)                  echo 7z;     return ;;
+        *.rar)                        echo rar;    return ;;
+        *.gz)                         echo gz;     return ;;
+        *.bz2)                        echo bz2;    return ;;
+        *.xz)                         echo xz;     return ;;
+        *.zst|*.zstd)                 echo zst;    return ;;
+        *.lz4)                        echo lz4;    return ;;
+        *.lzma)                       echo lzma;   return ;;
+        *.lz)                         echo lz;     return ;;
+        *.z)                          echo Z;      return ;;
+        *.cab)                        echo cab;    return ;;
+        *.deb|*.udeb)                 echo deb;    return ;;
+        *.rpm)                        echo rpm;    return ;;
+        *.iso|*.img)                  echo iso;    return ;;
+        *.cpio)                       echo cpio;   return ;;
+        *.ar|*.a)                     echo ar;     return ;;
+        *.arj)                        echo arj;    return ;;
+        *.lha|*.lzh)                  echo lha;    return ;;
+        *.exe|*.bin|*.msi)            echo selfx;  return ;;  # try 7z (self-extracting / NSIS / MSI)
+    esac
+
+    # --- Magic-byte fallback via `file` -------------------------------------
+    have file || { echo unknown; return; }
+    magic="$(file -bz -- "$f" 2>/dev/null)"   # -z peeks inside compressed too
+    local m
+    m="$(printf '%s' "$magic" | tr '[:upper:]' '[:lower:]')"
+
+    case "$m" in
+        *"posix tar"*|*"tar archive"*)
+            # `file -z` reports the inner format too; figure out the compressor
+            case "$m" in
+                *gzip*)    echo targz;  return ;;
+                *bzip2*)   echo tarbz2; return ;;
+                *"xz comp"*|*xz*) echo tarxz; return ;;
+                *zstandard*) echo tarzst; return ;;
+                *) echo tar; return ;;
+            esac ;;
+        *zip\ archive*)        echo zip;  return ;;
+        *7-zip*)               echo 7z;   return ;;
+        *rar\ archive*)        echo rar;  return ;;
+        *gzip\ compressed*)    echo gz;   return ;;
+        *bzip2\ compressed*)   echo bz2;  return ;;
+        *xz\ compressed*)      echo xz;   return ;;
+        *zstandard*)           echo zst;  return ;;
+        *lz4\ compressed*)     echo lz4;  return ;;
+        *lzma\ compressed*)    echo lzma; return ;;
+        *"lzip compressed"*)   echo lz;   return ;;
+        *"compress'd data"*)   echo Z;    return ;;
+        *"microsoft cabinet"*) echo cab;  return ;;
+        *"debian binary package"*) echo deb; return ;;
+        *rpm*)                 echo rpm;  return ;;
+        *iso\ 9660*)           echo iso;  return ;;
+        *cpio\ archive*)       echo cpio; return ;;
+        *"current ar archive"*) echo ar;  return ;;
+        *arj\ archive*)        echo arj;  return ;;
+        *)                     echo unknown; return ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Extract one file (assumes we're already in the destination directory and
+# $src is an absolute path).
+# ---------------------------------------------------------------------------
+do_extract() {
+    local type="$1" src="$2" tool
+    local list="$OPT_LIST"
+
+    case "$type" in
+        targz)
+            if [ "$list" -eq 1 ]; then run tar tzf "$src"; else run tar xzf "$src"; fi ;;
+        tarbz2)
+            if [ "$list" -eq 1 ]; then run tar tjf "$src"; else run tar xjf "$src"; fi ;;
+        tarxz)
+            if [ "$list" -eq 1 ]; then run tar tJf "$src"; else run tar xJf "$src"; fi ;;
+        tarzst)
+            if have zstd; then
+                if [ "$list" -eq 1 ]; then run tar --zstd -tf "$src"; else run tar --zstd -xf "$src"; fi
+            else err "need zstd for $src"; return 1; fi ;;
+        tarlz4)
+            tool="$(pick lz4)" || { err "need lz4 for $src"; return 1; }
+            if [ "$list" -eq 1 ]; then lz4 -dc "$src" | tar tf -; else lz4 -dc "$src" | tar xf -; fi ;;
+        tarlzma)
+            if [ "$list" -eq 1 ]; then run tar --lzma -tf "$src"; else run tar --lzma -xf "$src"; fi ;;
+        tarlz)
+            if [ "$list" -eq 1 ]; then run tar --lzip -tf "$src"; else run tar --lzip -xf "$src"; fi ;;
+        tarZ)
+            if [ "$list" -eq 1 ]; then run tar -tZf "$src"; else run tar -xZf "$src"; fi ;;
+        tar)
+            if [ "$list" -eq 1 ]; then run tar tf "$src"; else run tar xf "$src"; fi ;;
+
+        zip)
+            tool="$(pick unzip 7z 7za bsdtar)" || { err "need unzip/7z/bsdtar for $src"; return 1; }
+            case "$tool" in
+                unzip)  if [ "$list" -eq 1 ]; then run unzip -l "$src"; else run unzip -o "$src"; fi ;;
+                7z|7za) if [ "$list" -eq 1 ]; then run "$tool" l "$src"; else run "$tool" x -y "$src"; fi ;;
+                bsdtar) if [ "$list" -eq 1 ]; then run bsdtar tf "$src"; else run bsdtar xf "$src"; fi ;;
+            esac ;;
+
+        7z)
+            tool="$(pick 7z 7za 7zr)" || { err "need p7zip (7z) for $src"; return 1; }
+            if [ "$list" -eq 1 ]; then run "$tool" l "$src"; else run "$tool" x -y "$src"; fi ;;
+
+        rar)
+            tool="$(pick unrar unar 7z 7za bsdtar)" || { err "need unrar/unar/7z for $src"; return 1; }
+            case "$tool" in
+                unrar)  if [ "$list" -eq 1 ]; then run unrar l "$src"; else run unrar x -o+ "$src"; fi ;;
+                unar)   run unar -f "$src" ;;
+                7z|7za) if [ "$list" -eq 1 ]; then run "$tool" l "$src"; else run "$tool" x -y "$src"; fi ;;
+                bsdtar) run bsdtar xf "$src" ;;
+            esac ;;
+
+        gz)   if [ "$list" -eq 1 ]; then run gzip -l "$src"; else stream_to "$(basename "${src%.*}")" gzip -dc "$src"; fi ;;
+        bz2)  stream_to "$(basename "${src%.*}")" bzip2 -dc "$src" ;;
+        xz)   stream_to "$(basename "${src%.*}")" xz -dc "$src" ;;
+        zst)  tool="$(pick zstd)" || { err "need zstd for $src"; return 1; }
+              run zstd -d -o "$(basename "${src%.*}")" "$src" ;;
+        lz4)  tool="$(pick lz4)" || { err "need lz4 for $src"; return 1; }
+              stream_to "$(basename "${src%.*}")" lz4 -dc "$src" ;;
+        lzma) stream_to "$(basename "${src%.*}")" xz --format=lzma -dc "$src" ;;
+        lz)   tool="$(pick lzip plzip)" || { err "need lzip for $src"; return 1; }
+              stream_to "$(basename "${src%.*}")" "$tool" -dc "$src" ;;
+        Z)    if have gunzip; then stream_to "$(basename "${src%.*}")" gunzip -c "$src";
+              elif have uncompress; then run uncompress "$src";
+              else err "need gunzip/uncompress for $src"; return 1; fi ;;
+
+        cab)  tool="$(pick cabextract 7z 7za)" || { err "need cabextract/7z for $src"; return 1; }
+              if [ "$tool" = cabextract ]; then run cabextract "$src"; else run "$tool" x -y "$src"; fi ;;
+
+        deb)  if have dpkg-deb; then run dpkg-deb -x "$src" .;
+              elif have ar; then run ar x "$src"; warn "extracted deb members (control/data tarballs) — re-run extract on data.tar.*";
+              else err "need dpkg-deb or ar for $src"; return 1; fi ;;
+
+        rpm)  if have rpm2cpio && have cpio; then rpm2cpio "$src" | cpio -idmv;
+              elif have bsdtar; then run bsdtar xf "$src";
+              else err "need rpm2cpio+cpio or bsdtar for $src"; return 1; fi ;;
+
+        iso)  tool="$(pick 7z 7za bsdtar)" || { err "need 7z or bsdtar for $src"; return 1; }
+              if [ "$tool" = bsdtar ]; then run bsdtar xf "$src"; else run "$tool" x -y "$src"; fi ;;
+
+        cpio) if [ "$list" -eq 1 ]; then cpio -itv < "$src"; else cpio -idmv < "$src"; fi ;;
+
+        ar)   run ar x "$src" ;;
+
+        arj)  tool="$(pick arj 7z 7za)" || { err "need arj/7z for $src"; return 1; }
+              if [ "$tool" = arj ]; then run arj x "$src"; else run "$tool" x -y "$src"; fi ;;
+
+        lha)  tool="$(pick lha lhasa 7z)" || { err "need lha for $src"; return 1; }
+              if [ "$tool" = 7z ]; then run 7z x -y "$src"; else run "$tool" x "$src"; fi ;;
+
+        selfx)
+            # self-extracting exe / NSIS / MSI — 7z can usually crack these open
+            tool="$(pick 7z 7za)" || { err "cannot handle $src without 7z"; return 1; }
+            run "$tool" x -y "$src" ;;
+
+        unknown|*)
+            err "unknown or unsupported format: $src"
+            have file && warn "file says: $(file -b -- "$src")"
+            return 1 ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+status=0
+for f in "${files[@]}"; do
+    if [ ! -e "$f" ]; then err "no such file: $f"; status=1; continue; fi
+    if [ ! -r "$f" ]; then err "not readable: $f"; status=1; continue; fi
+
+    # Resolve to an absolute path so cd into destdir still finds it
+    src="$(cd "$(dirname -- "$f")" && pwd)/$(basename -- "$f")"
+
+    type="$(detect_type "$f")"
+    vrb "detected type for '$f': $type"
+
+    if [ "$OPT_LIST" -eq 1 ]; then
+        info "listing: $f  [$type]"
+        do_extract "$type" "$src" || status=1
+        continue
+    fi
+
+    dest="$(prepare_destdir "$f")" || { status=1; continue; }
+
+    info "extracting: $f  [$type]${dest:+ -> $dest/}"
+
+    (
+        [ "$dest" != "." ] && cd -- "$dest"
+        do_extract "$type" "$src"
+    )
+    rc=$?
+
+    if [ "$rc" -ne 0 ]; then
+        status=1
+        continue
+    fi
+
+    if [ "$OPT_REMOVE" -eq 1 ]; then
+        rm -f -- "$src" && info "removed source: $f"
+    fi
+done
+
+exit "$status"
